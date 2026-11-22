@@ -1,0 +1,143 @@
+name: Build and verify downloadable previews
+
+on:
+  push:
+    branches: [main, 'arena/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go race tests and frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  windows:
+    name: Windows native tests and portable EXEs
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: go test -count=1 ./...
+      - run: npm run build:windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    name: Kotlin APK, JNI core, lint and emulator smoke tests
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Install pinned Android SDK and NDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+      - run: npm ci && npm run build
+      - name: Compile Go for Android and build installable debug APK
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
+          bash scripts/build-android.sh
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Verify JNI initialization and packaged UI in Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: gradle -p android --no-daemon :app:connectedDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-preview
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-test-reports
+          path: |
+            android/app/build/reports/
+            android/app/build/outputs/androidTest-results/
+          retention-days: 14
+
+  publish:
+    name: Publish public preview downloads
+    if: github.event_name == 'push' && github.ref == 'refs/heads/arena/ca1b124e-horizon-manager'
+    needs: [test, windows, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-preview
+          path: release
+      - name: Create public prerelease with checksums and provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          (cd release && sha256sum *.exe *.apk > SHA256SUMS.txt)
+          cp docs/release-notes.md release-notes.md
+          printf '\nBuilt from commit `%s`.\n\n[Successful build and test run](%s/%s/actions/runs/%s)\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> release-notes.md
+          gh release create "v0.2.0-go-preview.${{ github.run_number }}" release/*.exe release/*.apk release/SHA256SUMS.txt --target "$GITHUB_SHA" --prerelease --title "Horizon Manager · Go preview ${{ github.run_number }}" --notes-file release-notes.md
