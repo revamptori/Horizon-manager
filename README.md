@@ -54,7 +54,7 @@ npm run desktop             # build/run the Go desktop launcher
 npm run build:windows       # cross-compile x64 and ARM64 portable EXEs to release/
 ```
 
-For Android, install JDK 17, Gradle 8.13, SDK platform/build-tools 35, and NDK `28.0.13004108` on Linux, then:
+For Android, install JDK 21 (the app targets JVM bytecode 17), Gradle 8.13, SDK platform/build-tools 35, and NDK `28.0.13004108` on Linux, then:
 
 ```sh
 npm ci && npm run build
